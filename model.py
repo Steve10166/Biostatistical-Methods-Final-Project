@@ -9,7 +9,6 @@ from torch.utils.data import DataLoader, random_split
 from sklearn.metrics import classification_report, confusion_matrix
 from PIL import Image
 
-# ——— Paths & output dirs ———
 data_dir        = 'Pistachio_Image_Dataset'
 checkpoint_path = 'resnet18_pistachio_checkpoint.pth'
 output_dir      = 'reports'
@@ -18,41 +17,34 @@ gradcam_dir     = os.path.join(output_dir, 'gradcam')
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs(gradcam_dir, exist_ok=True)
 
-# ——— Device ———
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ——— Transforms ———
-# Deterministic eval transforms
 eval_transform = transforms.Compose([
     transforms.Resize(256),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
 ])
-# For saving heatmap overlays, we need to “undo” the normalization:
 inv_normalize = transforms.Normalize(
     mean=[-m/s for m,s in zip([0.485,0.456,0.406],[0.229,0.224,0.225])],
     std =[1/s    for s in             [0.229,0.224,0.225]]
 )
 
-# ——— Dataset & Val-Loader ———
 full_ds = datasets.ImageFolder(data_dir, transform=eval_transform)
 class_names = full_ds.classes
 n_tot   = len(full_ds)
 n_train = int(0.8 * n_tot)
 n_val   = n_tot - n_train
-torch.manual_seed(42)  # for reproducibility
+torch.manual_seed(42)
 _, val_ds = random_split(full_ds, [n_train, n_val])
 val_loader = DataLoader(val_ds, batch_size=32, shuffle=False)
 
-# ——— Model & Checkpoint ———
 model = models.resnet18(pretrained=False)
 model.fc = nn.Linear(model.fc.in_features, len(class_names))
 state = torch.load(checkpoint_path, map_location=device)
 model.load_state_dict(state)
 model = model.to(device).eval()
 
-# ——— Evaluation ———
 all_preds, all_labels = [], []
 with torch.no_grad():
     for imgs, labels in val_loader:
@@ -62,10 +54,8 @@ with torch.no_grad():
         all_preds.extend(preds.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
 
-# — Classification report — 
 print(classification_report(all_labels, all_preds, target_names=class_names))
 
-# — Confusion matrix plot — 
 cm = confusion_matrix(all_labels, all_preds)
 fig, ax = plt.subplots(figsize=(6,5))
 im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
@@ -82,17 +72,14 @@ fig.savefig(cm_png)
 plt.close(fig)
 print(f"Saved confusion matrix → {cm_png}")
 
-# ——— Grad-CAM utility ———
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
         self.gradients = None
         self.activations = None
 
-        # forward hook
         def forward_hook(module, inp, outp):
             self.activations = outp.detach()
-        # backward hook
         def backward_hook(module, grad_in, grad_out):
             self.gradients = grad_out[0].detach()
 
@@ -100,11 +87,6 @@ class GradCAM:
         target_layer.register_backward_hook(backward_hook)
 
     def __call__(self, input_tensor, class_idx=None):
-        """
-        input_tensor: 1×C×H×W normalized image
-        class_idx:   which class to compute CAM for (defaults to top-pred)
-        returns:     H×W numpy heatmap in [0,1]
-        """
         self.model.zero_grad()
         out = self.model(input_tensor)
         if class_idx is None:
@@ -112,7 +94,6 @@ class GradCAM:
         score = out[0, class_idx]
         score.backward(retain_graph=True)
 
-        # global-average-pooling on gradients
         weights = self.gradients.mean(dim=(2,3))[0]  
         cam = torch.zeros(self.activations.shape[2:], dtype=torch.float32)
 
@@ -123,34 +104,27 @@ class GradCAM:
         cam -= cam.min()
         cam /= (cam.max() + 1e-8)
         cam = cam.cpu().numpy()
-        # resize to 224×224
         cam = cv2.resize(cam, (input_tensor.size(3), input_tensor.size(2)))
         return cam
 
-# instantiate GradCAM on the last conv layer of ResNet-18
 target_layer = model.layer4[1].conv2
 gradcam = GradCAM(model, target_layer)
 
-# ——— Generate & save a few Grad-CAM overlays ———
 for idx in range(10):
     img_tensor, label = val_ds[idx]
     input_tensor = img_tensor.unsqueeze(0).to(device)
-    cam = gradcam(input_tensor)           # H×W heatmap
+    cam = gradcam(input_tensor)
 
-    # reconstruct original image for overlay
-    orig = inv_normalize(img_tensor)      # undo norm
+    orig = inv_normalize(img_tensor)
     orig = orig.permute(1,2,0).cpu().numpy()
     orig = np.clip(orig, 0, 1)
 
-    # colorize CAM
     heatmap = cv2.applyColorMap(np.uint8(cam*255), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
 
-    # overlay
     overlay = heatmap + orig
     overlay = overlay / overlay.max()
 
-    # save
     fn = os.path.join(gradcam_dir, f"gradcam_{idx}_true-{class_names[label]}.png")
     Image.fromarray(np.uint8(overlay*255)).save(fn)
 
